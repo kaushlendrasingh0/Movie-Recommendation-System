@@ -1,125 +1,292 @@
-import pandas as pd
 import ast
+import re
+
+import pandas as pd
+import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import streamlit as st
-
-# Load movie datasets
-movies = pd.read_csv("data/tmdb_5000_movies.csv")
-credits = pd.read_csv("data/tmdb_5000_credits.csv")
-
-# Combine both datasets
-movies = movies.merge(credits, left_on="id", right_on="movie_id")
-
-# Keep only useful columns
-movies = movies[["movie_id", "title_x", "overview", "genres", "keywords", "cast", "crew"]]
-movies = movies.rename(columns={"title_x": "title"})
-
-# Convert JSON-like columns into simple text
-
-def convert_to_list(text):
-    items = ast.literal_eval(text)
-    return [item["name"] for item in items]
 
 
-movies["genres"] = movies["genres"].apply(convert_to_list)
-movies["keywords"] = movies["keywords"].apply(convert_to_list)
-
-# Extract top 3 cast members
-def get_cast(text):
-    items = ast.literal_eval(text)
-    return [item["name"] for item in items[:3]]
-
-
-# Extract director name
-def get_director(text):
-    items = ast.literal_eval(text)
-    for item in items:
-        if item["job"] == "Director":
-            return [item["name"]]
-    return []
-
-
-movies["cast"] = movies["cast"].apply(get_cast)
-movies["crew"] = movies["crew"].apply(get_director)
-
-# Replace missing values with empty lists
-movies["overview"] = movies["overview"].fillna("")
-movies["genres"] = movies["genres"].apply(lambda x: x if isinstance(x, list) else [])
-movies["keywords"] = movies["keywords"].apply(lambda x: x if isinstance(x, list) else [])
-movies["cast"] = movies["cast"].apply(lambda x: x if isinstance(x, list) else [])
-movies["crew"] = movies["crew"].apply(lambda x: x if isinstance(x, list) else [])
-
-# Create a single tags column
-movies["tags"] = (
-    movies["overview"] + " " +
-    movies["genres"].apply(lambda x: " ".join(x)) + " " +
-    movies["keywords"].apply(lambda x: " ".join(x)) + " " +
-    movies["cast"].apply(lambda x: " ".join(x)) + " " +
-    movies["crew"].apply(lambda x: " ".join(x))
-)
-
-# Convert movie tags into numerical vectors using TF-IDF
-tfidf = TfidfVectorizer(max_features=5000, stop_words="english")
-tfidf_matrix = tfidf.fit_transform(movies["tags"])
-
-# Calculate similarity between all movies
-similarity = cosine_similarity(tfidf_matrix)
-
-# Recommendation function
-def recommend(movie_title):
-    movie_title = movie_title.lower()
-
-    matches = movies[movies["title"].str.lower() == movie_title]
-
-    if matches.empty:
-        return []
-
-    movie_index = matches.index[0]
-
-    distances = similarity[movie_index]
-
-    movie_list = sorted(
-        list(enumerate(distances)),
-        reverse=True,
-        key=lambda x: x[1]
-    )[1:11]
-
-    recommendations = []
-
-    for i, score in movie_list:
-        recommendations.append(
-            (movies.iloc[i]["title"], round(score * 100, 2))
-        )
-
-    return recommendations
-
-
-# Streamlit application
+# ---------------------------------------------------------
+# Page configuration
+# ---------------------------------------------------------
 st.set_page_config(
     page_title="Movie Recommendation System",
     page_icon="🎬",
     layout="wide"
 )
 
-st.title("🎬 Movie Recommendation System")
-st.write("Find movies similar to your favorite movie using Machine Learning.")
 
-movie_titles = sorted(movies["title"].dropna().unique())
+# ---------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------
+def parse_names(value, limit=None):
+    """Extract names from TMDB JSON-like columns."""
+    if pd.isna(value):
+        return ""
+
+    try:
+        data = ast.literal_eval(value)
+        if isinstance(data, list):
+            names = []
+
+            for item in data:
+                if isinstance(item, dict) and "name" in item:
+                    names.append(str(item["name"]))
+
+            if limit:
+                names = names[:limit]
+
+            return " ".join(names)
+
+    except (ValueError, SyntaxError, TypeError):
+        return ""
+
+    return ""
+
+
+def get_director(value):
+    """Extract director name from crew column."""
+    if pd.isna(value):
+        return ""
+
+    try:
+        data = ast.literal_eval(value)
+
+        if isinstance(data, list):
+            for item in data:
+                if (
+                    isinstance(item, dict)
+                    and item.get("job") == "Director"
+                    and item.get("name")
+                ):
+                    return str(item["name"])
+
+    except (ValueError, SyntaxError, TypeError):
+        return ""
+
+    return ""
+
+
+def clean_text(text):
+    """Clean text for TF-IDF processing."""
+    text = str(text).lower()
+    text = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+# ---------------------------------------------------------
+# Load datasets
+# ---------------------------------------------------------
+@st.cache_data
+def load_data():
+    movies = pd.read_csv("data/tmdb_5000_movies.csv")
+    credits = pd.read_csv("data/tmdb_5000_credits.csv")
+
+    # Keep only required columns
+    movies = movies[
+        ["id", "title", "overview", "genres", "keywords"]
+    ].copy()
+
+    credits = credits[
+        ["movie_id", "cast", "crew"]
+    ].copy()
+
+    # Merge datasets
+    movies = movies.merge(
+        credits,
+        left_on="id",
+        right_on="movie_id",
+        how="left"
+    )
+
+    # Remove duplicate movie IDs if any
+    movies = movies.drop_duplicates(subset="id").reset_index(drop=True)
+
+    # Fill missing values
+    for column in ["title", "overview", "genres", "keywords", "cast", "crew"]:
+        movies[column] = movies[column].fillna("")
+
+    # Convert JSON-like columns into useful text
+    movies["genres_text"] = movies["genres"].apply(parse_names)
+    movies["keywords_text"] = movies["keywords"].apply(parse_names)
+    movies["cast_text"] = movies["cast"].apply(
+        lambda x: parse_names(x, limit=5)
+    )
+    movies["director_text"] = movies["crew"].apply(get_director)
+
+    # Create combined recommendation features
+    movies["combined_features"] = (
+        movies["overview"]
+        + " "
+        + movies["genres_text"]
+        + " "
+        + movies["keywords_text"]
+        + " "
+        + movies["cast_text"]
+        + " "
+        + movies["director_text"]
+    )
+
+    movies["combined_features"] = movies["combined_features"].apply(
+        clean_text
+    )
+
+    return movies
+
+
+# ---------------------------------------------------------
+# Build recommendation model
+# ---------------------------------------------------------
+@st.cache_resource
+def build_model(movies):
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        max_features=50000
+    )
+
+    feature_matrix = vectorizer.fit_transform(
+        movies["combined_features"]
+    )
+
+    similarity_matrix = cosine_similarity(feature_matrix)
+
+    return similarity_matrix
+
+
+# ---------------------------------------------------------
+# Recommendation function
+# ---------------------------------------------------------
+def recommend_movies(movie_title, movies, similarity_matrix, number=8):
+    matches = movies.index[
+        movies["title"].str.lower() == movie_title.lower()
+    ].tolist()
+
+    if not matches:
+        return []
+
+    movie_index = matches[0]
+
+    similarity_scores = list(
+        enumerate(similarity_matrix[movie_index])
+    )
+
+    similarity_scores = sorted(
+        similarity_scores,
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    recommendations = []
+
+    for index, score in similarity_scores[1:number + 1]:
+        recommendations.append(
+            {
+                "title": movies.iloc[index]["title"],
+                "score": round(float(score) * 100, 2)
+            }
+        )
+
+    return recommendations
+
+
+# ---------------------------------------------------------
+# Load model
+# ---------------------------------------------------------
+movies = load_data()
+similarity_matrix = build_model(movies)
+
+
+# ---------------------------------------------------------
+# User Interface
+# ---------------------------------------------------------
+st.title("Movie Recommendation System")
+
+st.markdown(
+    "Find movies similar to your favorite movie using "
+    "Machine Learning."
+)
+
+st.divider()
+
+st.subheader("Select a Movie")
+
+movie_titles = sorted(
+    movies["title"].dropna().unique().tolist()
+)
 
 selected_movie = st.selectbox(
-    "🎥 Select a movie:",
+    "Choose a movie:",
     movie_titles
 )
 
-# Recommend similar movies
-if st.button("🎬 Recommend Movies"):
-    recommendations = recommend(selected_movie)
+
+# ---------------------------------------------------------
+# Recommendation button
+# ---------------------------------------------------------
+if st.button("Recommend Movies", type="primary"):
+
+    recommendations = recommend_movies(
+        selected_movie,
+        movies,
+        similarity_matrix,
+        number=8
+    )
 
     if recommendations:
-        st.subheader("🍿 Recommended Movies")
 
-        for movie, score in recommendations:
-            st.write(f"**{movie}** — Similarity: {score}%")
+        st.divider()
+        st.subheader("Recommended Movies")
+
+        st.success(
+            f"Movies similar to: {selected_movie}"
+        )
+
+        for number, movie in enumerate(recommendations, start=1):
+
+            st.markdown(
+                f"### {number}. {movie['title']}"
+            )
+
+            st.progress(
+                min(movie["score"] / 100, 1.0)
+            )
+
+            st.caption(
+                f"Similarity Score: {movie['score']:.2f}%"
+            )
+
+            st.divider()
+
     else:
-        st.warning("Movie not found.")
+        st.warning(
+            "Sorry, the selected movie was not found."
+        )
+
+
+# ---------------------------------------------------------
+# Project information
+# ---------------------------------------------------------
+with st.expander("About this Project"):
+
+    st.write(
+        """
+        This project uses a Content-Based Recommendation System.
+
+        Machine Learning techniques used:
+
+        - TF-IDF Vectorization
+        - Cosine Similarity
+        - Natural Language Processing
+        - Content-Based Filtering
+
+        The system analyzes movie information such as
+        genres, keywords, overview, cast and director to
+        recommend similar movies.
+        """
+    )
+
+st.caption(
+    "Built with Python, Pandas, Scikit-learn and Streamlit"
+)
